@@ -1,17 +1,21 @@
 import streamlit as st
 import torch
 import torch.nn.functional as F
+from pathlib import Path
 from PIL import Image
 from torchvision import transforms
 from transformers import ViTForImageClassification, ViTImageProcessor
 import pandas as pd
 import time
+import cv2
+import numpy as np
+from crack_measure import calculate_crack_length
 
 # ===============================
 # Configuration
 # ===============================
 
-MODEL_PATH = "vit_microcrack.pth"
+MODEL_PATH = Path(__file__).resolve().parent / "vit_microcrack.pth"
 CLASS_NAMES = ["Negative", "Positive"]  # must match training dataset.classes order
 IMAGE_SIZE = 224
 
@@ -293,7 +297,7 @@ with tab_single:
 
         start = time.time()
         label, probs = predict(image, model, transform)
-        elapsed = (time.time() - start) * 1000
+        elapsed = time.time() - start
         confidence = max(probs) * 100
         is_fail = label == "Positive"
 
@@ -310,9 +314,17 @@ with tab_single:
                 st.warning("Below review threshold — recommend manual inspection.")
 
             st.markdown(
-                f'<div class="readout-value">Inference time <span>{elapsed:.1f} ms</span></div>',
+                f'<div class="readout-value">Inference time <span>{elapsed:.2f} sec</span></div>',
                 unsafe_allow_html=True
             )
+
+            if is_fail:
+                opencv_img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+                length, result = calculate_crack_length(opencv_img)
+
+                st.subheader("Crack Analysis")
+                st.metric("Estimated Crack Length", f"{length:.2f} pixels")
+                st.image(cv2.cvtColor(result, cv2.COLOR_BGR2RGB), caption="Detected Crack")
 
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown('<div class="panel-label">CLASS PROBABILITIES</div>', unsafe_allow_html=True)
@@ -352,10 +364,20 @@ with tab_batch:
         for i, file in enumerate(uploaded_files):
             image = Image.open(file)
             label, probs = predict(image, model, transform)
+            confidence_pct = round(max(probs) * 100, 2)
+            verdict = "DEFECT" if label == "Positive" else "CLEAR"
+
+            crack_length_px = 0.0
+            if label == "Positive":
+                opencv_img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+                crack_length_px, _ = calculate_crack_length(opencv_img)
+                crack_length_px = round(crack_length_px, 2)
+
             results.append({
                 "Filename": file.name,
-                "Verdict": "DEFECT" if label == "Positive" else "CLEAR",
-                "Confidence (%)": round(max(probs) * 100, 2)
+                "Verdict": verdict,
+                "Confidence (%)": confidence_pct,
+                "Crack Length (px)": crack_length_px
             })
             progress.progress((i + 1) / len(uploaded_files), text=f"Scanning {i+1}/{len(uploaded_files)}")
 
