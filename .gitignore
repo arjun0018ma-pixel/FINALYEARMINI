@@ -4,3 +4,37 @@ dataset/
 __pycache__/
 .vscode/
 *.pyc
+
+# Embedded ML Generated Files
+embedded_ml/*.keras
+embedded_ml/*.tflite
+embedded_ml/model_data.h
+embedded_ml/test_image.h
+embedded_ml/*.h
+
+# Results & Metrics
+results/
+*.json
+*.png
+
+# Python environments
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+*.bak

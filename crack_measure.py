@@ -1,122 +1,87 @@
 import cv2
 import numpy as np
-from skimage.morphology import skeletonize
 
-def calculate_crack_length(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    edges = cv2.Canny(blur, 50, 150)
-    kernel = np.ones((3, 3), np.uint8)
-    edges = cv2.dilate(edges, kernel, iterations=1)
-    edges = cv2.erode(edges, kernel, iterations=1)
+def _skeletonize(binary_mask: np.ndarray) -> np.ndarray:
+    """Morphological thinning to reduce a crack mask to a 1-pixel-wide centerline."""
+    img = (binary_mask > 0).astype(np.uint8) * 255
+    skel = np.zeros_like(img)
+    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
 
-    contours, _ = cv2.findContours(
-        edges,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_NONE
-    )
+    while True:
+        eroded = cv2.erode(img, element)
+        opened = cv2.dilate(eroded, element)
+        temp = cv2.subtract(img, opened)
+        skel = cv2.bitwise_or(skel, temp)
+        img = eroded.copy()
+        if cv2.countNonZero(img) == 0:
+            break
 
-    filtered = []
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        if h > w * 2 and cv2.contourArea(cnt) > 10:
-            filtered.append(cnt)
+    return skel
 
-    if not filtered:
-        return 0.0, image.copy()
 
-    total_length = sum(cv2.arcLength(cnt, False) for cnt in filtered)
-    result = image.copy()
-    cv2.drawContours(result, filtered, -1, (0, 255, 0), 2)
-
-    return total_length, result
-
-def calculate_crack_length_v3(image, roi=None):
+def calculate_crack_length(opencv_img: np.ndarray):
     """
-    roi: optional (y1, y2, x1, x2). Leave as None for general use —
-    only set it if you're manually cropping out a specific known
-    obstruction in one particular photo. Never hardcode a fixed ROI
-    for all images; crack location varies per photo.
+    Takes a BGR OpenCV image, segments dark microcracks under soft focus or uneven
+    lighting, extracts the 1-pixel centerline skeleton, and returns:
+        (length_in_pixels: float, annotated_bgr_image: np.ndarray)
     """
-    work = image.copy()
-    # Diagnostic: log input shape and dtype to help debug runtime issues
-    try:
-        print(f"[crack-length] input shape: {work.shape}, dtype: {work.dtype}")
-    except Exception:
-        print("[crack-length] input info unavailable")
-    if roi is not None:
-        y1, y2, x1, x2 = roi
-        work = work[y1:y2, x1:x2]
+    overlay = opencv_img.copy()
+    gray = cv2.cvtColor(opencv_img, cv2.COLOR_BGR2GRAY)
 
-    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+    # 1. Local contrast enhancement + blur to handle soft ESP32-CAM focus
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
-    blur = cv2.GaussianBlur(enhanced, (3, 3), 0)
+    blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
 
-    med = np.median(blur)
-    lower = int(max(0, 0.66 * med))
-    upper = int(min(255, 1.33 * med))
-    edges = cv2.Canny(blur, lower, upper)
+    # 2. Adaptive inverse threshold to isolate dark fissures on lighter surfaces
+    mask = cv2.adaptiveThreshold(
+        blurred,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        blockSize=31,
+        C=12,
+    )
 
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel_close, iterations=2)
-    closed = cv2.dilate(closed, np.ones((3, 3), np.uint8), iterations=1)
+    # 3. Clean small speckles and bridge tiny gaps along the fissure
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-    print(f"[crack-length] contours found: {len(contours)}")
+    # 4. Keep elongated crack contours (reject small dots and large shadow blocks)
+    h, w = gray.shape
+    img_area = h * w
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # FIX: rotated bounding box works at any angle, not just vertical
-    filtered = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < 15:
+    clean_mask = np.zeros_like(mask)
+    valid_contours = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < 45 or area > img_area * 0.25:
             continue
-        (cx, cy), (rw, rh), angle = cv2.minAreaRect(cnt)
+
+        rect = cv2.minAreaRect(c)
+        rw, rh = rect[1]
         if rw == 0 or rh == 0:
             continue
-        long_side, short_side = max(rw, rh), min(rw, rh)
-        if long_side < 15:
-            continue
-        if long_side / short_side > 3:
-            filtered.append(cnt)
+        aspect_ratio = max(rw, rh) / min(rw, rh)
 
-    print(f"[crack-length] filtered (passed shape test): {len(filtered)}")
-    if not filtered:
-        print("[crack-length] no filtered contours — returning zero length")
-        return 0.0, image.copy(), None
+        # Cracks are elongated structures (aspect ratio >= 2.2)
+        if aspect_ratio >= 2.2:
+            cv2.drawContours(clean_mask, [c], -1, 255, thickness=cv2.FILLED)
+            valid_contours.append(c)
 
-    mask = np.zeros(closed.shape, dtype=np.uint8)
-    cv2.drawContours(mask, filtered, -1, 255, thickness=cv2.FILLED)
-    cv2.drawContours(mask, filtered, -1, 255, thickness=2)
+    # 5. Measure true pixel length along the 1-pixel skeleton centerline
+    skeleton = _skeletonize(clean_mask)
+    length_px = float(cv2.countNonZero(skeleton))
 
-    skeleton = skeletonize(mask > 0)
-    ys, xs = np.where(skeleton)
-    coords = set(zip(ys.tolist(), xs.tolist()))
-    total_length = 0.0
-    for (y, x) in coords:
-        for dy, dx in [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]:
-            if (y+dy, x+dx) in coords:
-                total_length += (dy**2 + dx**2) ** 0.5
-    total_length /= 2.0
+    # Fallback to half-perimeter if skeletonization leaves 0 pixels on very thin segments
+    if length_px == 0.0 and valid_contours:
+        length_px = float(sum(cv2.arcLength(c, closed=True) * 0.5 for c in valid_contours))
 
-    result = image.copy()
-    offset_y, offset_x = (roi[0], roi[2]) if roi is not None else (0, 0)
-    sk_ys, sk_xs = np.where(skeleton)
-    for y, x in zip(sk_ys, sk_xs):
-        cv2.circle(result, (x + offset_x, y + offset_y), 2, (0, 0, 255), -1)
+    # 6. Draw contour boundary + bright green centerline on output preview
+    cv2.drawContours(overlay, valid_contours, -1, (0, 200, 255), 1)
+    overlay[skeleton > 0] = (0, 255, 80)
 
-    print(f"[crack-length] final length: {total_length}")
-    return total_length, result, skeleton
-
-
-if __name__ == "__main__":
-    img = cv2.imread("your_image.png")
-
-    # Restrict to the region containing just the crack — adjust these
-    # to your photo (excludes roof texture, pipes, switch boxes, etc.)
-    roi = None
-
-    length, result, skeleton = calculate_crack_length_v3(img, roi=roi)
-    print("Total crack length (skeleton, px):", round(length, 2))
-    cv2.imwrite("result.png", result)
+    return round(length_px, 2), overlay
